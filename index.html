@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirGap Whisper - audio transfer test</title>
+<style>
+:root{--bg:#f6f7f9;--fg:#14171c;--mut:#5d6672;--card:#fff;--line:#d9dde3;--acc:#0b6bcb;--ok:#14803c;--bad:#c62828}
+@media (prefers-color-scheme:dark){:root{--bg:#101318;--fg:#e8ebef;--mut:#98a2ae;--card:#181c23;--line:#2a303a;--acc:#5aa7ff;--ok:#4cc77a;--bad:#ff7b72}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:16px;max-width:640px;margin-inline:auto}
+h1{font-size:1.3rem;margin:4px 0 2px}
+p.sub{margin:0 0 16px;color:var(--mut)}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
+h2{font-size:1rem;margin:0 0 10px}
+button{font:inherit;padding:10px 14px;border-radius:8px;border:1px solid var(--acc);background:var(--acc);color:#fff;cursor:pointer}
+button.alt{background:transparent;color:var(--acc)}
+button:disabled{opacity:.5}
+button:focus-visible,select:focus-visible,textarea:focus-visible,input:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+textarea,select,input[type=file]{width:100%;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);margin-bottom:10px}
+.meter{height:10px;border-radius:5px;background:var(--line);overflow:hidden;margin:10px 0}
+.meter i{display:block;height:100%;width:0;background:var(--acc);transition:width .08s}
+#status{font-weight:600}
+#result{white-space:pre-wrap;word-break:break-word;margin-top:8px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+pre{margin:8px 0 0;max-height:140px;overflow:auto;font-size:.8rem;color:var(--mut);white-space:pre-wrap}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+</style>
+</head>
+<body>
+<h1>AirGap Whisper - audio transfer test</h1>
+<p class="sub">Open this page on two devices. One listens, the other sends. No network between them.</p>
+
+<section>
+  <h2>Settings (same on both devices)</h2>
+  <select id="sym" aria-label="Symbol length">
+    <option value="100">Safe: 80 bit/s (100 ms per byte)</option>
+    <option value="60" selected>Normal: 133 bit/s (60 ms per byte)</option>
+    <option value="40">Fast: 200 bit/s (40 ms per byte, quiet room)</option>
+  </select>
+</section>
+
+<section>
+  <h2>Receive</h2>
+  <button id="listenBtn">Start listening</button>
+  <div class="meter" aria-hidden="true"><i id="lvl"></i></div>
+  <div id="status">Not listening</div>
+  <div id="result"></div>
+</section>
+
+<section>
+  <h2>Send</h2>
+  <textarea id="txt" rows="3" placeholder="Type a short message">Hello from the other device</textarea>
+  <input type="file" id="file" aria-label="Optional small file">
+  <div class="row"><button id="sendBtn">Send over sound</button><span id="txInfo"></span></div>
+</section>
+
+<pre id="log"></pre>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const F = {sync: 1000, baseA: 1500, baseB: 4000, step: 150};
+let ctx, proc, micStream, timer, listening = false, txBusy = false;
+let buf, w = 0, scanPos = 0, run = 0, state = "idle", syncEnd = 0, expect = 0, symMs = 60;
+
+function log(m){ const l = $("log"); l.textContent = new Date().toLocaleTimeString() + "  " + m + "\n" + l.textContent; }
+function setStatus(m, cls){ const s = $("status"); s.textContent = m; s.className = cls || ""; }
+function symLen(){ return Math.round(ctx.sampleRate * symMs / 1000); }
+function maxPayload(){ return Math.floor(115000 / symMs) - 4; }
+function getCtx(){ if(!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)(); return ctx; }
+
+$("sym").onchange = e => { symMs = +e.target.value; log("Symbol length " + symMs + " ms"); };
+
+function crc16(bytes){
+  let c = 0xFFFF;
+  for(const b of bytes){ c ^= b << 8; for(let i = 0; i < 8; i++) c = (c & 0x8000) ? ((c << 1) ^ 0x1021) & 0xFFFF : (c << 1) & 0xFFFF; }
+  return c;
+}
+function goertzel(x, s, n, f, sr){
+  const k = 2 * Math.cos(2 * Math.PI * f / sr); let a = 0, b = 0;
+  for(let i = s; i < s + n; i++){ const c = x[i] + k * a - b; b = a; a = c; }
+  return a * a + b * b - k * a * b;
+}
+
+/* ---------- Transmit ---------- */
+function buildSignal(payload){
+  const sr = ctx.sampleRate, S = symLen();
+  const body = [(payload.length >> 8) & 255, payload.length & 255, ...payload];
+  const c = crc16(body);
+  const bytes = [...body, c >> 8, c & 255];
+  const lead = Math.round(sr * 0.25), syncN = Math.round(sr * 0.3), fade = Math.round(sr * 0.004);
+  const out = new Float32Array(lead + syncN + bytes.length * S);
+  for(let i = 0; i < syncN; i++){
+    const e = Math.min(1, i / 200, (syncN - i) / 200);
+    out[lead + i] = 0.8 * e * Math.sin(2 * Math.PI * F.sync * i / sr);
+  }
+  bytes.forEach((b, k) => {
+    const fa = F.baseA + F.step * (b >> 4), fb = F.baseB + F.step * (b & 15), o = lead + syncN + k * S;
+    for(let i = 0; i < S; i++){
+      const e = Math.min(1, i / fade, (S - i) / fade);
+      out[o + i] = 0.4 * e * (Math.sin(2 * Math.PI * fa * i / sr) + Math.sin(2 * Math.PI * fb * i / sr));
+    }
+  });
+  return out;
+}
+
+async function send(){
+  getCtx(); await ctx.resume();
+  symMs = +$("sym").value;
+  const enc = new TextEncoder(); let payload;
+  const f = $("file").files[0];
+  if(f){
+    const name = enc.encode(f.name).slice(0, 255);
+    payload = [1, name.length, ...name, ...new Uint8Array(await f.arrayBuffer())];
+  } else {
+    payload = [0, ...enc.encode($("txt").value)];
+  }
+  if(payload.length > maxPayload()){ $("txInfo").textContent = "Too big. Max " + maxPayload() + " bytes at this speed."; return; }
+  const sig = buildSignal(payload);
+  const ab = ctx.createBuffer(1, sig.length, ctx.sampleRate); ab.copyToChannel(sig, 0);
+  const src = ctx.createBufferSource(); src.buffer = ab; src.connect(ctx.destination);
+  const dur = sig.length / ctx.sampleRate;
+  txBusy = true; $("sendBtn").disabled = true;
+  $("txInfo").textContent = "Sending " + payload.length + " bytes, about " + dur.toFixed(1) + " s. Keep devices close.";
+  src.start();
+  log("TX " + payload.length + " bytes, " + dur.toFixed(1) + " s");
+  setTimeout(() => {
+    txBusy = false; $("sendBtn").disabled = false; $("txInfo").textContent = "Sent.";
+    state = "idle"; scanPos = w; run = 0;
+  }, dur * 1000 + 400);
+}
+$("sendBtn").onclick = send;
+
+/* ---------- Receive ---------- */
+async function startListen(){
+  getCtx(); await ctx.resume();
+  try{
+    micStream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1}});
+  }catch(err){ setStatus("Microphone blocked: " + err.message, "bad"); return; }
+  symMs = +$("sym").value;
+  const src = ctx.createMediaStreamSource(micStream);
+  proc = ctx.createScriptProcessor(4096, 1, 1);
+  const mute = ctx.createGain(); mute.gain.value = 0;
+  src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+  buf = new Float32Array(Math.round(ctx.sampleRate * 120));
+  w = scanPos = run = 0; state = "idle"; listening = true;
+  proc.onaudioprocess = e => {
+    if(txBusy) return;
+    const d = e.inputBuffer.getChannelData(0);
+    if(w + d.length > buf.length){ w = scanPos = run = 0; state = "idle"; }
+    buf.set(d, w); w += d.length;
+    let s = 0, n = 0; for(let i = 0; i < d.length; i += 8){ s += d[i] * d[i]; n++; }
+    $("lvl").style.width = Math.min(100, Math.sqrt(s / n) * 500) + "%";
+  };
+  timer = setInterval(poll, 80);
+  $("listenBtn").textContent = "Stop listening";
+  setStatus("Listening...");
+  log("Listening at " + ctx.sampleRate + " Hz, " + symMs + " ms symbols");
+}
+function stopListen(){
+  listening = false; clearInterval(timer);
+  if(proc){ proc.disconnect(); proc.onaudioprocess = null; }
+  if(micStream) micStream.getTracks().forEach(t => t.stop());
+  $("listenBtn").textContent = "Start listening"; $("lvl").style.width = "0"; setStatus("Not listening");
+}
+$("listenBtn").onclick = () => listening ? stopListen() : startListen();
+
+function toneRatio(s, n){
+  let e = 0; for(let i = s; i < s + n; i++) e += buf[i] * buf[i];
+  if(e / n < 1e-6) return 0;
+  return 2 * goertzel(buf, s, n, F.sync, ctx.sampleRate) / (n * e);
+}
+function decodeSym(k){
+  const S = symLen(), m = Math.round(S * 0.2), s = syncEnd + k * S + m, n = S - 2 * m, sr = ctx.sampleRate;
+  let ba = 0, pa = -1, bb = 0, pb = -1;
+  for(let i = 0; i < 16; i++){
+    const p1 = goertzel(buf, s, n, F.baseA + F.step * i, sr); if(p1 > pa){ pa = p1; ba = i; }
+    const p2 = goertzel(buf, s, n, F.baseB + F.step * i, sr); if(p2 > pb){ pb = p2; bb = i; }
+  }
+  return (ba << 4) | bb;
+}
+function poll(){
+  if(!listening || txBusy) return;
+  const sr = ctx.sampleRate, S = symLen();
+  if(state === "idle"){
+    const W = Math.round(sr * 0.02), hop = Math.round(sr * 0.01);
+    while(scanPos + W <= w){
+      if(toneRatio(scanPos, W) > 0.5) run++;
+      else {
+        if(run >= 20){ syncEnd = scanPos + Math.round(W * 0.65); state = "head"; run = 0; scanPos += hop; setStatus("Signal found, receiving..."); log("Sync detected"); break; }
+        run = 0;
+      }
+      scanPos += hop;
+    }
+    if(state === "idle" && scanPos > sr * 20){ buf.copyWithin(0, scanPos, w); w -= scanPos; scanPos = 0; }
+  }
+  if(state === "head" && w >= syncEnd + 2 * S){
+    const len = (decodeSym(0) << 8) | decodeSym(1);
+    if(len < 1 || len > maxPayload()){ log("Bad length " + len + ", ignoring"); state = "idle"; scanPos = syncEnd; setStatus("Listening..."); return; }
+    expect = len + 4; state = "body";
+  }
+  if(state === "body" && w >= syncEnd + expect * S){
+    const bytes = []; for(let k = 0; k < expect; k++) bytes.push(decodeSym(k));
+    const body = bytes.slice(0, expect - 2), crc = (bytes[expect - 2] << 8) | bytes[expect - 1];
+    const ok = crc16(body) === crc, secs = 0.3 + expect * S / sr;
+    state = "idle"; scanPos = syncEnd + expect * S; run = 0;
+    if(!ok){ setStatus("Received with errors (CRC failed). Move closer or use Safe speed.", "bad"); log("CRC fail"); return; }
+    const p = body.slice(2), bps = Math.round(p.length * 8 / secs);
+    setStatus("Received " + p.length + " bytes in " + secs.toFixed(1) + " s (" + bps + " bit/s effective)", "ok");
+    log("RX ok " + p.length + " bytes, " + bps + " bit/s");
+    show(p);
+  }
+}
+function show(p){
+  const r = $("result"); r.textContent = "";
+  if(p[0] === 1){
+    const nl = p[1], name = new TextDecoder().decode(new Uint8Array(p.slice(2, 2 + nl)));
+    const url = URL.createObjectURL(new Blob([new Uint8Array(p.slice(2 + nl))]));
+    const a = document.createElement("a"); a.href = url; a.download = name; a.textContent = "Download " + name;
+    r.appendChild(a);
+  } else {
+    r.textContent = new TextDecoder().decode(new Uint8Array(p.slice(1)));
+  }
+}
+</script>
+</body>
+</html>
